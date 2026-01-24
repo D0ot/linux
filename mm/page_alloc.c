@@ -3811,6 +3811,9 @@ retry:
 		struct page *page;
 		unsigned long mark;
 
+		/*
+		 * 检查当前Zone所在的Node是否是在对应的cpusets设置里面。
+		 */
 		if (cpusets_enabled() &&
 			(alloc_flags & ALLOC_CPUSET) &&
 			!__cpuset_zone_allowed(zone, gfp_mask))
@@ -3835,15 +3838,22 @@ retry:
 		 * dirty-throttling and the flusher threads.
 		 */
 		if (ac->spread_dirty_pages) {
+			/* 对于一个Node只检查一次 */
 			if (last_pgdat != zone->zone_pgdat) {
 				last_pgdat = zone->zone_pgdat;
 				last_pgdat_dirty_ok = node_dirty_ok(zone->zone_pgdat);
 			}
 
+			/* 因为当前的循环是以Zone为循环变量，但是这个spred dirty
+			 * 的判断却是以Node为单位，会出现多次continue
+			 */
 			if (!last_pgdat_dirty_ok)
 				continue;
 		}
 
+		/* no_fallback 其实就是 alloc_flags & ALLOC_NOFRAGMENT, 在一定情况下保
+		 * 证locality而不是保证尽可能少的碎片
+		 */
 		if (no_fallback && !defrag_mode && nr_online_nodes > 1 &&
 		    zone != zonelist_zone(ac->preferred_zoneref)) {
 			int local_nid;
@@ -3867,6 +3877,14 @@ retry:
 		 * kswapd wakeups on only some nodes. Avoid accidental
 		 * "node_reclaim_mode"-like behavior in this case.
 		 */
+
+		/* 这个地方为什么不用 ZONE_RECLAIM_ACTIVE 来进行判断？
+		 * 1. kswapd是唤醒状态，下面这个!waitqueue_active()判断就是true
+		 * 2. ZONE_RECLAIM_ACTIVE 只在扫描特定Zone的之后被Set
+		 * 3. 更主要的是: ZONE_RECLAIM_ACTIVE 是Zone层面的标志，现在
+		 *    考虑的是在Node层面，对应Node的kswapd是否在活动
+		 *
+		 */
 		if (skip_kswapd_nodes &&
 		    !waitqueue_active(&zone->zone_pgdat->kswapd_wait)) {
 			skipped_kswapd_nodes = true;
@@ -3882,10 +3900,33 @@ retry:
 		 * premature page reclaiming.  Detection is done here to
 		 * avoid to do that in hotter free path.
 		 */
+
+		/*
+		 * 内核开发者认为free的路径更加hot... 可能的原因如下
+		 * 1. free往往是很多page同时free
+		 * 2. allocate的路径可能需要touch cache, 所以检查开销占比更低
+		 * 3. free往往发生在一些非进程上下文，比较敏感
+		 */
 		if (test_bit(ZONE_BELOW_HIGH, &zone->flags))
 			goto check_alloc_wmark;
 
+		
+		/*
+		 * 注意，所有的 *_wmark_pages() 都考虑了 boost
+		 * 而且这个地方不是考虑 alloc_flags，而是直接以high来算
+		 */
 		mark = high_wmark_pages(zone);
+		/* 判断当下空闲页数量和 high watermark 的相对关系
+		 * 这个 zone_watermark_fast() 的判断里面考虑了：
+		 * 1. HIGHATOMIC reserved.
+		 * 2. lowmem_reserve.
+		 * 3. ALLOC_MIN_RESERVE | ALLOC_OOM | ALLOC_NON_BLOCK 相关标志...
+		 *	注意ALLOC_RESERVES, 这个Macro中的每个Bit都可能影响结果
+		 * 
+		 * 超过了high watermark直接try_this_zone.
+		 * 没有超过则设置ZONE_BELOW_HIGH标志
+		 * 这个标志会在更加'hot'的free path中被检查
+		 */
 		if (zone_watermark_fast(zone, order, mark,
 					ac->highest_zoneidx, alloc_flags,
 					gfp_mask))
@@ -3894,6 +3935,11 @@ retry:
 			set_bit(ZONE_BELOW_HIGH, &zone->flags);
 
 check_alloc_wmark:
+		/*
+		 * 判断实际进行分配需要的wmark
+		 * 如果 zone_watermark_fast() 判断不过
+		 * 就要进行 Node-Level的Reclaim了
+		 */
 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
 		if (!zone_watermark_fast(zone, order, mark,
 				       ac->highest_zoneidx, alloc_flags,
@@ -3912,10 +3958,12 @@ check_alloc_wmark:
 					goto try_this_zone;
 			}
 			/* Checked here to keep the fast path fast */
+			/* ALLOC_NO_WATERMARKS的意思：不管wmarks，就硬分配 */
 			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);
 			if (alloc_flags & ALLOC_NO_WATERMARKS)
 				goto try_this_zone;
 
+			/* 可能node reclaim是不被允许的；Node距离太远也不行 */
 			if (!node_reclaim_enabled() ||
 			    !zone_allows_reclaim(zonelist_zone(ac->preferred_zoneref), zone))
 				continue;

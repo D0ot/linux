@@ -2336,6 +2336,10 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 	 * Target desirable inactive:active list ratios for the anon
 	 * and file LRU lists.
 	 */
+
+	/*
+	 * 对于 node local reclaim, sc->force_deactivate 总是 false
+	 */
 	if (!sc->force_deactivate) {
 		unsigned long refaults;
 
@@ -6053,6 +6057,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 again:
 	memset(&sc->nr, 0, sizeof(sc->nr));
 
+	/* 每次扫描，相关的状态改变都放在sc scan_control 里面了 */
 	nr_reclaimed = sc->nr_reclaimed;
 	nr_scanned = sc->nr_scanned;
 
@@ -7622,9 +7627,13 @@ static unsigned long __node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask,
 	/*
 	 * We need to be able to allocate from the reserves for RECLAIM_UNMAP
 	 */
+	/* 
+	 * 后续所有的分配都会默认带上 __GFP_MEMALLOC，除非使用 __GFP_NOMEMALLOC
+	 */
 	noreclaim_flag = memalloc_noreclaim_save();
 	set_task_reclaim_state(p, &sc->reclaim_state);
 
+	/* 依旧是确保最低的unmapped pages量与slab的量 */
 	if (node_pagecache_reclaimable(pgdat) > pgdat->min_unmapped_pages ||
 	    node_page_state_pages(pgdat, NR_SLAB_RECLAIMABLE_B) > pgdat->min_slab_pages) {
 		/*
@@ -7633,6 +7642,9 @@ static unsigned long __node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask,
 		 */
 		do {
 			shrink_node(pgdat, sc);
+			/*
+			 * 目前，local node reclaim 的初始 priority 是 4
+			 */
 		} while (sc->nr_reclaimed < nr_pages && --sc->priority >= 0);
 	}
 
@@ -7673,6 +7685,13 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 	 * if less than a specified percentage of the node is used by
 	 * unmapped file backed pages.
 	 */
+	/*
+	 * 这一步是
+	 * 1. 保留一部分unmapped的，防止出现I/O的Cache颠簸
+	 * 2. 保留一部分可回收的Slab(kmem_cache->flags & SLAB_RECLAIM_)
+	 *	还是在保证不出现缓存颠簸
+	 * 3. min_unmapped_pages, min_slab_pages 这两个参数都是/proc可调的
+	 */
 	if (node_pagecache_reclaimable(pgdat) <= pgdat->min_unmapped_pages &&
 	    node_page_state_pages(pgdat, NR_SLAB_RECLAIMABLE_B) <=
 	    pgdat->min_slab_pages)
@@ -7680,6 +7699,10 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 
 	/*
 	 * Do not scan if the allocation should not be delayed.
+	 */
+
+	/*
+	 * 现在无法进行阻塞Reclaim，所以直接返回 NOSCAN
 	 */
 	if (!gfpflags_allow_blocking(gfp_mask) || (current->flags & PF_MEMALLOC))
 		return NODE_RECLAIM_NOSCAN;
@@ -7690,9 +7713,13 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 	 * over remote processors and spread off node memory allocations
 	 * as wide as possible.
 	 */
+	/*
+	 * 防止有CPU的Node被其他Node上的CPU进行Reclaim
+	 */
 	if (node_state(pgdat->node_id, N_CPU) && pgdat->node_id != numa_node_id())
 		return NODE_RECLAIM_NOSCAN;
 
+	/* 防止并行的 Reclaim */
 	if (test_and_set_bit_lock(PGDAT_RECLAIM_LOCKED, &pgdat->flags))
 		return NODE_RECLAIM_NOSCAN;
 
