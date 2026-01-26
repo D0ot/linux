@@ -1981,12 +1981,15 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	bool stalled = false;
 
+	/* isolated > inactive 就会throttle */
 	while (unlikely(too_many_isolated(pgdat, file, sc))) {
 		if (stalled)
 			return 0;
 
 		/* wait a bit for the reclaimer. */
 		stalled = true;
+
+		/* 小睡一会，具体睡眠时间是 HZ/50 */
 		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED);
 
 		/* We are about to die and free our memory. Return now. */
@@ -2243,6 +2246,7 @@ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 				 struct lruvec *lruvec, struct scan_control *sc)
 {
 	if (is_active_lru(lru)) {
+		/* may_deactivate可能在prepare_scan_control()里面设置 */
 		if (sc->may_deactivate & (1 << is_file_lru(lru)))
 			shrink_active_list(nr_to_scan, lruvec, sc, lru);
 		else
@@ -2250,6 +2254,7 @@ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 		return 0;
 	}
 
+	/* Reclaim 下一层 */
 	return shrink_inactive_list(nr_to_scan, lruvec, sc, lru);
 }
 
@@ -2327,6 +2332,12 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 	/*
 	 * Determine the scan balance between anon and file LRUs.
 	 */
+
+	/*
+	 * anon_cost和file_cost的计算是相对的，具体数值不用在意
+	 * 大体上表示之前回收的I/O操作开销与rotata销
+	 * rorate指的是folio本来应该回收，但因为被reference,所以又放回active
+	 */
 	spin_lock_irq(&target_lruvec->lru_lock);
 	sc->anon_cost = target_lruvec->anon_cost;
 	sc->file_cost = target_lruvec->file_cost;
@@ -2339,6 +2350,8 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 
 	/*
 	 * 对于 node local reclaim, sc->force_deactivate 总是 false
+	 * 如果不是强制 force_deactivate 那就根据具体的refaults情况来选择是否
+	 * deactivate
 	 */
 	if (!sc->force_deactivate) {
 		unsigned long refaults;
@@ -2371,6 +2384,12 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 	 * thrashing, try to reclaim those first before touching
 	 * anonymous pages.
 	 */
+
+	/*
+	 * 如果inactive文件页很多，并且还不允许deactivate，那就开启 cache_trim_mode
+	 *
+	 * cache_trim_mode会导致后面的get_scan_count()返回SCAN_FILE，只扫描文件页
+	 */
 	file = lruvec_page_state(target_lruvec, NR_INACTIVE_FILE);
 	if (file >> sc->priority && !(sc->may_deactivate & DEACTIVATE_FILE) &&
 	    !sc->no_cache_trim_mode)
@@ -2387,6 +2406,8 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 	 * thrashing file LRU becomes infinitely more attractive than
 	 * anon pages.  Try to detect this based on file LRU size.
 	 */
+
+	/* 对于 node reclaim, target memcg是NULL, the branch is taken. */
 	if (!cgroup_reclaim(sc)) {
 		unsigned long total_high_wmark = 0;
 		unsigned long free, anon;
@@ -2408,6 +2429,16 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 		 */
 		anon = node_page_state(pgdat, NR_INACTIVE_ANON);
 
+		/*
+		 * 这里意思大概是：
+		 * 1. 文件页全部回收了也不会到达 high wmark
+		 * 2. 不可以deactivate 匿名页，这个有点奇怪，不应该是可以降级
+		 *	匿名页的时候才合适吗
+		 * 3. 匿名页的数量很多，不回收文件页是Okay的
+		 *
+		 * file_is_tiny 意味着后面的get_scan_count()返回SCAN_ANON
+		 * 只会扫描匿名页了
+		 */
 		sc->file_is_tiny =
 			file + free <= total_high_wmark &&
 			!(sc->may_deactivate & DEACTIVATE_ANON) &&
@@ -2441,6 +2472,7 @@ static inline void calculate_pressure_balance(struct scan_control *sc,
 	file_cost = total_cost + sc->file_cost;
 	total_cost = anon_cost + file_cost;
 
+	/* 根据swappiness来计算比例 */
 	ap = swappiness * (total_cost + 1);
 	ap /= anon_cost + 1;
 
@@ -2534,6 +2566,14 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	enum lru_list lru;
 
 	/* If we have no swap space, do not bother scanning anon folios. */
+
+	/* can_reclaim_anon_pages() 主要进行的判断
+	 * 1. 全局swap空间够不够
+	 * 2. 对于特定的memcg的swap配额够不够
+	 * 3. 能不能做demote: 将内存放入特定的“低级Node”，比如说CXL内存
+	 *
+	 * 对于node reclaim, may_swap == 1
+	 */
 	if (!sc->may_swap || !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
 		scan_balance = SCAN_FILE;
 		goto out;
@@ -2596,6 +2636,7 @@ out:
 		unsigned long scan;
 
 		lruvec_size = lruvec_lru_size(lruvec, lru, sc->reclaim_idx);
+		/* 如果memcg的low/min的数值比较大，那么scan的页会变少 */
 		scan = apply_proportional_protection(memcg, sc, lruvec_size);
 		scan >>= sc->priority;
 
@@ -5819,6 +5860,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 				nr_to_scan = min(nr[lru], SWAP_CLUSTER_MAX);
 				nr[lru] -= nr_to_scan;
 
+				/* Reclaim 下一层 */
 				nr_reclaimed += shrink_list(lru, nr_to_scan,
 							    lruvec, sc);
 			}
@@ -5982,6 +6024,10 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	if (current_is_kswapd() || sc->memcg_full_walk)
 		partial = NULL;
 
+	/*
+	 * 对于Node Reclaim，这个target_memcg是NULL
+	 * 相当于从root开始，逐层级遍历下面的memcg
+	 */
 	memcg = mem_cgroup_iter(target_memcg, NULL, partial);
 	do {
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
@@ -5996,6 +6042,9 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 		 */
 		cond_resched();
 
+		/*
+		 * 计算effective min/low 数值
+		 */
 		mem_cgroup_calculate_protection(target_memcg, memcg);
 
 		if (mem_cgroup_below_min(target_memcg, memcg)) {
@@ -6011,6 +6060,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 			 * there is an unprotected supply
 			 * of reclaimable memory from other cgroups.
 			 */
+			/* 对于Node Reclaim，这个是false */
 			if (!sc->memcg_low_reclaim) {
 				sc->memcg_low_skipped = 1;
 				continue;
@@ -6021,6 +6071,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 		reclaimed = sc->nr_reclaimed;
 		scanned = sc->nr_scanned;
 
+		/* Reclaim 下一层*/
 		shrink_lruvec(lruvec, sc);
 
 		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
@@ -6061,15 +6112,26 @@ again:
 	nr_reclaimed = sc->nr_reclaimed;
 	nr_scanned = sc->nr_scanned;
 
+	/* 算一下是否打开 may_deactivate 和 cache_trim_mode */
 	prepare_scan_control(pgdat, sc);
 
+	/* Reclaim 下一层 */
 	shrink_node_memcgs(pgdat, sc);
 
+	/*
+	 * 在 LRU Based Reclaim 之外，其他的一些回收会在current->reclaim_state
+	 * 里面进行记录，这里就是在进行同步，将其他的回收量加入 sc->nr_reclaimed
+	 */
 	flush_reclaim_state(sc);
 
 	nr_node_reclaimed = sc->nr_reclaimed - nr_reclaimed;
 
 	/* Record the subtree's reclaim efficiency */
+
+	/*
+	 * vmpressure 机制是计算相关数值
+	 * 在数值满足特定条件满足时通过eventfd来通知用户态程序
+	 */
 	if (!sc->proactive)
 		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
 			   sc->nr_scanned - nr_scanned, nr_node_reclaimed);
@@ -7588,6 +7650,14 @@ static unsigned long node_pagecache_reclaimable(struct pglist_data *pgdat)
 	 * pages like swapcache and node_unmapped_file_pages() provides
 	 * a better estimate
 	 */
+
+	/*
+	 * NR_FILE_PAGES 包含如下类型的页
+	 * 1. 普通的文件页, mapped和unmapped的都算上
+	 * 2. Direct I/O读取磁盘的buffer
+	 * 3. shmem/tmpfs
+	 * 4. swapcache, 在swap中有对应位置的匿名页也算上
+	 */
 	if (node_reclaim_mode & RECLAIM_UNMAP)
 		nr_pagecache_reclaimable = node_page_state(pgdat, NR_FILE_PAGES);
 	else
@@ -7596,6 +7666,12 @@ static unsigned long node_pagecache_reclaimable(struct pglist_data *pgdat)
 	/*
 	 * Since we can't clean folios through reclaim, remove dirty file
 	 * folios from consideration.
+	 */
+
+	/*
+	 * 在某个PATCH之后，确实不需要检查 NR_FILE_DIRTY了
+	 * 因为在Direct Reclaim中，不再直接回写了
+	 * 见 "[PATCH v2 0/2] mm: vmscan: filter out the dirty file folios for node_reclaim()"
 	 */
 	delta += node_page_state(pgdat, NR_FILE_DIRTY);
 

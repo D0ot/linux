@@ -344,6 +344,9 @@ static unsigned long effective_protection(unsigned long usage,
 	unsigned long protected;
 	unsigned long ep;
 
+	/*
+	 * 先算一下已经用了的"usage"和要求"setting"的
+	 */
 	protected = min(usage, setting);
 	/*
 	 * If all cgroups at this level combined claim and use more
@@ -354,6 +357,11 @@ static unsigned long effective_protection(unsigned long usage,
 	 * claimed protection in order to be work-conserving: claimed
 	 * but unused protection is available to siblings that would
 	 * otherwise get a smaller chunk than what they claimed.
+	 */
+
+	/*
+	 * siblings_protected是子节点对应protect数值或者使用量(两者取小)的sum
+	 * 如果这个sum超过parent_effective，那就只能按比例分配
 	 */
 	if (siblings_protected > parent_effective)
 		return protected * parent_effective / siblings_protected;
@@ -394,13 +402,27 @@ static unsigned long effective_protection(unsigned long usage,
 	if (!recursive_protection)
 		return ep;
 
+	/*
+	 * 如果usage超过保护量，那么把父节点的保护量对于子节点们来说还有被
+	 * claim的那一部分拿出来当作effective
+	 */
 	if (parent_effective > siblings_protected &&
 	    parent_usage > siblings_protected &&
 	    usage > protected) {
 		unsigned long unclaimed;
 
+		/* 父节点还有没有被claim的保护容量 */
 		unclaimed = parent_effective - siblings_protected;
+
+		/* 乘上 “当前节点使用量超过保护值的超过量，未受保护的量” */
 		unclaimed *= usage - protected;
+
+		/*
+		 * 除以 “父节点总用量减去子节点保护数值的和”，
+		 * 这个数值其实是父节点中未受保护的总量。
+		 *
+		 * 所以这里也是按比例分配
+		 */
 		unclaimed /= parent_usage - siblings_protected;
 
 		ep += unclaimed;
