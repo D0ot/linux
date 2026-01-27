@@ -886,6 +886,7 @@ static enum folio_references folio_check_references(struct folio *folio,
 	int referenced_ptes, referenced_folio;
 	vm_flags_t vm_flags;
 
+	/* 通过rmap获取access bit的计数 */
 	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
 					   &vm_flags);
 
@@ -931,6 +932,10 @@ static enum folio_references folio_check_references(struct folio *folio,
 		 */
 		folio_set_referenced(folio);
 
+		/*
+		 * 这里的意思就是，两次PTE的reference就认为完全active
+		 * 如果仅仅是一个reference，先folio_set_referenced()
+		 */
 		if (referenced_folio || referenced_ptes > 1)
 			return FOLIOREF_ACTIVATE;
 
@@ -963,6 +968,7 @@ static void folio_check_dirty_writeback(struct folio *folio,
 	 * They could be mistakenly treated as file lru. So further anon
 	 * test is needed.
 	 */
+	/* 看上面的注释 */
 	if (!folio_is_file_lru(folio) ||
 	    (folio_test_anon(folio) && !folio_test_swapbacked(folio))) {
 		*dirty = false;
@@ -1122,6 +1128,7 @@ retry:
 			continue;
 		}
 
+		/* shrink_folio_list()不会用来处理从active上isolate下来的folio */
 		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
 
 		nr_pages = folio_nr_pages(folio);
@@ -1132,6 +1139,7 @@ retry:
 		if (unlikely(!folio_evictable(folio)))
 			goto activate_locked;
 
+		/* 不能unmap，那怎么都处理不了已经map了的folio，直接放回 */
 		if (!sc->may_unmap && folio_mapped(folio))
 			goto keep_locked;
 
@@ -1152,6 +1160,11 @@ retry:
 		 * through the LRU so quickly that the folios marked
 		 * for immediate reclaim are making it to the end of
 		 * the LRU a second time.
+		 */
+		/*
+		 * 到第二次扫到标记Reclaim的folio了，那就算是congested了
+		 *
+		 * 细看下面那一大段注释。
 		 */
 		if (writeback && folio_test_reclaim(folio))
 			stat->nr_congested += nr_pages;
@@ -1742,6 +1755,9 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		 */
 		scan += nr_pages;
 
+		/*
+		 * 先检查一下有没有人要试图从lruvec里面摘掉这个folio
+		 */
 		if (!folio_test_lru(folio))
 			goto move;
 		if (!sc->may_unmap && folio_mapped(folio))
@@ -1997,10 +2013,12 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 			return SWAP_CLUSTER_MAX;
 	}
 
+	/* 把cpu_fbatches里面暂存的folio给处理了 */
 	lru_add_drain();
 
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/* 拿锁然后隔离页，没什么好好说的 */
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
 
@@ -2016,10 +2034,15 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	if (nr_taken == 0)
 		return 0;
 
+	/*
+	 * 关于Reclaim最核心的部分
+	 */
 	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false,
 					 lruvec_memcg(lruvec));
 
 	spin_lock_irq(&lruvec->lru_lock);
+
+	/* 隔离了的但没回收的，想办法再放回去 */
 	move_folios_to_lru(lruvec, &folio_list);
 
 	mod_lruvec_state(lruvec, PGDEMOTE_KSWAPD + reclaimer_offset(sc),

@@ -53,8 +53,18 @@ static __always_inline void update_lru_size(struct lruvec *lruvec,
 				enum lru_list lru, enum zone_type zid,
 				long nr_pages)
 {
+	/* 会更新以下统计量
+	 * 1. Node 层面, node_stat_item
+	 * 2. Zone 层面, zone_stat_item
+	 * 3. memcg 层面，memcg_node_stat_items
+	 *	这个多一些，见 `struct lruvec_stats`
+	 */
 	__update_lru_size(lruvec, lru, zid, nr_pages);
 #ifdef CONFIG_MEMCG
+	/*
+	 * 更新 per node memcg的zone lru大小:
+	 * mz->lru_zone_size[zone][lru]
+	 * */
 	mem_cgroup_update_lru_size(lruvec, lru, zid, nr_pages);
 #endif
 }
@@ -340,6 +350,9 @@ static inline void folio_migrate_refs(struct folio *new, const struct folio *old
 static __always_inline
 void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 {
+	/*
+	 * 根据标志获取具体哪个LRU链表
+	 */
 	enum lru_list lru = folio_lru_list(folio);
 
 	if (lru_gen_add_folio(lruvec, folio, false))

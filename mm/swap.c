@@ -133,7 +133,17 @@ static void lru_add(struct lruvec *lruvec, struct folio *folio)
 	 * true of folios_put(): but those only clear the mlocked flag after
 	 * folio_put_testzero() has excluded any other users of the folio.)
 	 */
+
+	/*
+	 * UNEVICTABLE标志代表的是之前的记录
+	 *
+	 * 而folio_evictable()是要进行某种现在的判断，并通过判断进行数据更新
+	 */
 	if (folio_evictable(folio)) {
+		/*
+		 * 原本是不能回收的，现在能回收了
+		 * 增加PGRESCURED计数，意思是把某个页面“救”回来了
+		 */
 		if (was_unevictable)
 			__count_vm_events(UNEVICTABLE_PGRESCUED, nr_pages);
 	} else {
@@ -165,9 +175,20 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 		struct folio *folio = fbatch->folios[i];
 
 		/* block memcg migration while the folio moves between lru */
+		/*
+		 * 非添加到LRU的情况，意味着我们要把链表从某个地方摘下来
+		 * !folio_test_clear_lru()意味着有人先我们一步摘下来了
+		 * 所以什么都不干
+		 */
 		if (move_fn != lru_add && !folio_test_clear_lru(folio))
 			continue;
 
+		/*
+		 * 锁复用，如果在这个batch里面的folio共享一个锁，这里就有性能提升
+		 *
+		 * 如果是同一个锁，那就直接通过&lruvec返回对应的lruvec
+		 * 如果是不同的锁，那就释放原来folio的锁，再给新folio加锁
+		 */
 		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
 		move_fn(lruvec, folio);
 
@@ -186,10 +207,21 @@ static void __folio_batch_add_and_move(struct folio_batch __percpu *fbatch,
 
 	folio_get(folio);
 
+	/*
+	 * fbatches中只有一个成员需要进行关中断的local lock
+	 *	因为这个成员可能会在中断上下文被访问
+	 * 在一般内核的情况下，local lock只是关闭抢占
+	 */
 	if (disable_irq)
 		local_lock_irqsave(&cpu_fbatches.lock_irq, flags);
 	else
 		local_lock(&cpu_fbatches.lock);
+
+	/*
+	 * folio_batch_add()在空间满了的时候返回0
+	 * 大页无法被cache，内核开发者认为大页还cache影响平衡
+	 * 或者是cache被关掉的情况，具体见 lru_cache_disable()注释
+	 */
 
 	if (!folio_batch_add(this_cpu_ptr(fbatch), folio) ||
 			!folio_may_be_lru_cached(folio) || lru_cache_disabled())
@@ -567,6 +599,7 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
 	folio_clear_active(folio);
 	folio_clear_referenced(folio);
 
+	/* 正在进行回写或者是脏页 */
 	if (folio_test_writeback(folio) || folio_test_dirty(folio)) {
 		/*
 		 * Setting the reclaim flag could race with
@@ -575,6 +608,7 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
 		 * problem.
 		 */
 		lruvec_add_folio(lruvec, folio);
+		/* 标记这个页面写完就可以回收 */
 		folio_set_reclaim(folio);
 	} else {
 		/*
@@ -654,10 +688,12 @@ void lru_add_drain_cpu(int cpu)
 
 		/* No harm done if a racing interrupt already did this */
 		local_lock_irqsave(&cpu_fbatches.lock_irq, flags);
+		/* 会增加vm event RORATED计数 */
 		folio_batch_move_lru(fbatch, lru_move_tail);
 		local_unlock_irqrestore(&cpu_fbatches.lock_irq, flags);
 	}
 
+	/* 这下面是相关fbatch到实际LRU的转换，流程大多一致 */
 	fbatch = &fbatches->lru_deactivate_file;
 	if (folio_batch_count(fbatch))
 		folio_batch_move_lru(fbatch, lru_deactivate_file);
