@@ -1225,6 +1225,8 @@ retry:
 				stat->nr_immediate += nr_pages;
 				goto activate_locked;
 
+			/* 如果是Node Reclaim那就一定是Case 2 */
+
 			/* Case 2 above */
 			} else if (writeback_throttling_sane(sc) ||
 			    !folio_test_reclaim(folio) ||
