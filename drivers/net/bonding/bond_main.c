@@ -1929,6 +1929,7 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
 	 */
 	if (!bond_has_slaves(bond) &&
 	    bond->dev->addr_assign_type == NET_ADDR_RANDOM) {
+		/* NET_ADDR_RANDOM 可能会在 release slave 的时候设置，要注意 */
 		res = bond_set_dev_addr(bond->dev, slave_dev);
 		if (res)
 			goto err_undo_flags;
@@ -2431,6 +2432,14 @@ static int __bond_release_one(struct net_device *bond_dev,
 	}
 
 	bond_set_carrier(bond);
+	/*
+	 * 这个其实很奇怪，就算addr_assign_type是NET_ADDR_SET，也随机硬件地址
+	 * 如果用户态出现某种race，like this:
+	 * 1. set hw address of bond(or create bond device with hw address)
+	 * 2. enslaving nic1, release nic1
+	 * 3. enslaving nic2, 这个时候bond的hw地址就会偷nic2的，见enslaving的流程
+	 *
+	 */
 	if (!bond_has_slaves(bond))
 		eth_hw_addr_random(bond_dev);
 
