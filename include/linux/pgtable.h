@@ -156,6 +156,17 @@ static inline pud_t *pud_offset(p4d_t *p4d, unsigned long address)
 #define pud_offset pud_offset
 #endif
 
+/*
+ * pgd_offset_pgd() 页表PGD的地址和虚拟地址，找到对应的PGD Entry
+ * 见 pgd_offset() 和 pgd_offset_k()，我们可以知道 pgd_offset_pgd()的第一个参数
+ * 其实就是CR3中的地址
+ *
+ * pgd_index()是捞出PGD在地址转换过程中有效的9 bits
+ *
+ * p4d_index()和pgd_index()还不太一样，p4d_index()是从特定的 PGD Entry里面拿到P4D
+ * 的数组开头地址，然后加上 p4d_index()
+ *
+ */
 static inline pgd_t *pgd_offset_pgd(pgd_t *pgd, unsigned long address)
 {
 	return (pgd + pgd_index(address));

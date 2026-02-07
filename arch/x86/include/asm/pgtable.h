@@ -287,6 +287,10 @@ static inline unsigned long p4d_pfn(p4d_t p4d)
 	return (p4d_val(p4d) & p4d_pfn_mask(p4d)) >> PAGE_SHIFT;
 }
 
+/*
+ * pgd_pfn()拿到的是特定PGD Entry指向的那块4K页的PFN
+ * 另见pgd_page()的实现
+ */
 static inline unsigned long pgd_pfn(pgd_t pgd)
 {
 	return (pgd_val(pgd) & PTE_PFN_MASK) >> PAGE_SHIFT;

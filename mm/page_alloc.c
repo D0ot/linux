@@ -2491,6 +2491,11 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 	}
 
 	/*
+	 * 看下面这段注释，可以发现
+	 * enum rmqueue_mode *mode 完全是给rmqueue_bulk()准备的。
+	 */
+
+	/*
 	 * First try the freelists of the requested migratetype, then try
 	 * fallbacks modes with increasing levels of fragmentation risk.
 	 *
@@ -2515,6 +2520,7 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 		}
 		fallthrough;
 	case RMQUEUE_CLAIM:
+		/* claim 是一次拿一大块 pageblock_order */
 		page = __rmqueue_claim(zone, order, migratetype, alloc_flags);
 		if (page) {
 			/* Replenished preferred freelist, back to normal mode. */
@@ -2523,6 +2529,11 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 		}
 		fallthrough;
 	case RMQUEUE_STEAL:
+		/*
+		 * steal是一次偷一小块...所以在ALLOC_NOFRAGMENT的时候不允许steal
+		 * 直接在对应区域get_page_from_free_area()...
+		 * 也不会设置对应的migratetype
+		 */
 		if (!(alloc_flags & ALLOC_NOFRAGMENT)) {
 			page = __rmqueue_steal(zone, order, migratetype);
 			if (page) {
@@ -3995,6 +4006,11 @@ try_this_zone:
 			/*
 			 * If this is a high-order atomic allocation then check
 			 * if the pageblock should be reserved for the future
+			 */
+
+			/*
+			 * 意思是这次分配出来了HIGHATOMIC
+			 * 赶紧预留一些给下次分配？
 			 */
 			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
 				reserve_highatomic_pageblock(page, order, zone);
